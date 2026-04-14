@@ -1,0 +1,30 @@
+{
+  "papers": [
+    {
+      "id": "paper-default",
+      "name": "Papel 42g",
+      "width_m": 1.78,
+      "grammage_gm2": 42.0,
+      "cost_per_linear_meter": 1.8,
+      "cost_per_kg": 0.0,
+      "use_cost_per_kg": false,
+      "is_default": true
+    },
+    {
+      "id": "d1a950e3-47be-4efd-ac32-1bc5da4b4434",
+      "name": "Novo papel",
+      "width_m": 0.0,
+      "grammage_gm2": 0.0,
+      "cost_per_linear_meter": 0.0,
+      "cost_per_kg": 0.0,
+      "use_cost_per_kg": false,
+      "is_default": false
+    }
+  ],
+  "ink_cost_per_liter": {
+    "C": 240.3,
+    "M": 240.3,
+    "Y": 240.3,
+    "K": 240.3
+  }
+}
