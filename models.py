@@ -36,6 +36,7 @@ class ParsedLog:
     source_path: str
     file_size_bytes: int
     file_modified_at: str
+    source_fingerprint: str = ""
 
     # [General]
     computer_name: str = ""

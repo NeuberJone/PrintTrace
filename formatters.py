@@ -107,7 +107,7 @@ def bytes_to_mb(size_bytes: int) -> float:
 
 def fmt_file_size(size_bytes: int) -> str:
     """
-    Exibe KB ou MB com 2 casas.
+    Exibe B, KB ou MB com 2 casas quando necessário.
     """
     if size_bytes < 1024:
         return f"{size_bytes} B"

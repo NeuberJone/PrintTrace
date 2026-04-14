@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .formatters import safe_float
-from .models import INK_ORDER, PaperConfig
+from formatters import safe_float
+from models import INK_ORDER, PaperConfig
+
 
 CONFIG_PATH = Path("log_consultor.config.json")
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "papers": [
