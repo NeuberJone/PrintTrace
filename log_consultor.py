@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
@@ -14,10 +15,11 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "Print Consultor"
-APP_VERSION = "2.3"
+APP_VERSION = "2.5"
 CONFIG_PATH = Path("log_consultor.config.json")
 
 INK_ORDER = ["C", "M", "Y", "K"]
+
 
 DEFAULT_CONFIG = {
     "papers": [
@@ -100,9 +102,11 @@ def ensure_papers(config: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized: List[Dict[str, Any]] = []
     has_default = False
+
     for i, raw in enumerate(config["papers"]):
         if not isinstance(raw, dict):
             continue
+
         paper = {
             "id": str(raw.get("id") or f"paper-{i+1}"),
             "name": str(raw.get("name") or f"Papel {i+1}").strip(),
@@ -113,10 +117,12 @@ def ensure_papers(config: Dict[str, Any]) -> Dict[str, Any]:
             "use_cost_per_kg": bool(raw.get("use_cost_per_kg", False)),
             "is_default": bool(raw.get("is_default", False)),
         }
+
         if paper["is_default"] and not has_default:
             has_default = True
         else:
             paper["is_default"] = False
+
         normalized.append(paper)
 
     if not normalized:
@@ -205,6 +211,7 @@ class ParsedLog:
     source_path: str
     file_size_bytes: int
     file_modified_at: str
+    source_fingerprint: str = ""
 
     computer_name: str = ""
     software_version: str = ""
@@ -286,6 +293,77 @@ class ParsedLog:
     raw_sections: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
+def serialize_parsed_log(log: ParsedLog) -> Dict[str, Any]:
+    return asdict(log)
+
+
+def dict_to_log_item(data: Any) -> LogItem:
+    raw = data if isinstance(data, dict) else {}
+    field_names = {f.name for f in fields(LogItem)}
+    clean = {k: v for k, v in raw.items() if k in field_names}
+
+    if not isinstance(clean.get("kdots"), dict):
+        clean["kdots"] = {}
+
+    return LogItem(**clean)
+
+
+def dict_to_parsed_log(data: Any) -> ParsedLog:
+    raw = data if isinstance(data, dict) else {}
+    field_names = {f.name for f in fields(ParsedLog)}
+
+    clean = {k: v for k, v in raw.items() if k in field_names and k != "item"}
+
+    clean["source_path"] = str(clean.get("source_path", ""))
+    clean["file_size_bytes"] = int(clean.get("file_size_bytes", 0) or 0)
+    clean["file_modified_at"] = str(clean.get("file_modified_at", ""))
+    clean["source_fingerprint"] = str(clean.get("source_fingerprint", ""))
+
+    if not isinstance(clean.get("ink_ml"), dict):
+        clean["ink_ml"] = {}
+
+    if not isinstance(clean.get("ink_drop_sizes"), dict):
+        clean["ink_drop_sizes"] = {}
+
+    if not isinstance(clean.get("kdots_costs"), dict):
+        clean["kdots_costs"] = {}
+
+    if not isinstance(clean.get("raw_sections"), dict):
+        clean["raw_sections"] = {}
+
+    clean["item"] = dict_to_log_item(raw.get("item", {}))
+
+    return ParsedLog(**clean)
+
+
+def build_file_fingerprint(path: str) -> str:
+    p = Path(path)
+
+    try:
+        sha1 = hashlib.sha1()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                sha1.update(chunk)
+        return sha1.hexdigest()
+    except Exception:
+        try:
+            stat = p.stat()
+            return f"{p.name}|{stat.st_size}|{int(stat.st_mtime)}"
+        except Exception:
+            return str(p).lower()
+
+
+def collect_log_files_from_folder(folder: str, recursive: bool = True) -> List[str]:
+    root = Path(folder)
+    if not root.exists() or not root.is_dir():
+        return []
+
+    pattern = "**/*.txt" if recursive else "*.txt"
+    files = [str(p) for p in root.glob(pattern) if p.is_file()]
+    files.sort()
+    return files
+
+
 def parse_datetime(text: str) -> Optional[datetime]:
     text = (text or "").strip()
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
@@ -343,6 +421,7 @@ def parse_log_file(path: str) -> ParsedLog:
         source_path=str(p),
         file_size_bytes=stat.st_size,
         file_modified_at=datetime.fromtimestamp(stat.st_mtime).strftime("%d/%m/%Y %H:%M:%S"),
+        source_fingerprint=build_file_fingerprint(str(p)),
         raw_sections=sections,
     )
 
@@ -571,7 +650,6 @@ class ActionButton(ctk.CTkButton):
 class LogConsultorDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"{APP_NAME} — {APP_VERSION}")
         self.root.geometry("1660x940")
         self.root.minsize(1450, 840)
 
@@ -580,10 +658,138 @@ class LogConsultorDashboard:
         self.tree_id_to_log_index: Dict[str, int] = {}
         self.paper_name_to_id: Dict[str, str] = {}
 
+        self.current_session_path: Optional[str] = None
+        self.session_name: str = "Consulta sem título"
+        self.is_dirty: bool = False
+
         self.build_layout()
         self.refresh_paper_selector()
         self.refresh_clock()
         self.refresh_summary()
+        self.update_window_title()
+
+    def update_window_title(self):
+        dirty_suffix = " *" if self.is_dirty else ""
+        self.root.title(f"{APP_NAME} — {self.session_name}{dirty_suffix}")
+
+    def mark_dirty(self):
+        self.is_dirty = True
+        self.update_window_title()
+
+    def mark_clean(self):
+        self.is_dirty = False
+        self.update_window_title()
+
+    def confirm_discard_if_needed(self) -> bool:
+        if not self.is_dirty:
+            return True
+
+        return messagebox.askyesno(
+            APP_NAME,
+            "Há alterações não salvas na consulta atual.\n\nDeseja continuar mesmo assim?",
+        )
+
+    def build_session_payload(self) -> Dict[str, Any]:
+        return {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "session_name": self.session_name,
+            "logs": [serialize_parsed_log(log) for log in self.logs],
+        }
+
+    def apply_session_payload(self, payload: Dict[str, Any], path: str):
+        logs_raw = payload.get("logs", [])
+        if not isinstance(logs_raw, list):
+            raise ValueError("Estrutura inválida de consulta.")
+
+        self.logs = [dict_to_parsed_log(item) for item in logs_raw if isinstance(item, dict)]
+        self.current_session_path = path
+        self.session_name = str(payload.get("session_name") or Path(path).stem)
+
+        self.refresh_table()
+        self.refresh_summary()
+        self.show_consolidated_if_needed()
+        self.mark_clean()
+
+        messagebox.showinfo(
+            APP_NAME,
+            f"Consulta carregada com sucesso.\n\nLogs restaurados: {len(self.logs)}"
+        )
+
+    def new_session(self):
+        if self.logs or self.is_dirty:
+            if not self.confirm_discard_if_needed():
+                return
+
+        self.logs.clear()
+        self.current_session_path = None
+        self.session_name = "Consulta sem título"
+
+        self.refresh_table()
+        self.refresh_summary()
+        self.show_consolidated_if_needed()
+        self.mark_clean()
+
+    def open_session(self):
+        if self.logs or self.is_dirty:
+            if not self.confirm_discard_if_needed():
+                return
+
+        path = filedialog.askopenfilename(
+            title="Abrir consulta",
+            filetypes=[
+                ("Consultas PrintTrace", "*.ptc"),
+                ("Arquivos JSON", "*.json"),
+                ("Todos os arquivos", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("Arquivo inválido.")
+            self.apply_session_payload(raw, path)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Não foi possível abrir a consulta.\n\n{exc}")
+
+    def save_session(self):
+        if not self.current_session_path:
+            self.save_session_as()
+            return
+
+        try:
+            payload = self.build_session_payload()
+            Path(self.current_session_path).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self.mark_clean()
+            messagebox.showinfo(APP_NAME, "Consulta salva com sucesso.")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Não foi possível salvar a consulta.\n\n{exc}")
+
+    def save_session_as(self):
+        path = filedialog.asksaveasfilename(
+            title="Salvar consulta como",
+            defaultextension=".ptc",
+            filetypes=[
+                ("Consultas PrintTrace", "*.ptc"),
+                ("Arquivos JSON", "*.json"),
+            ],
+        )
+        if not path:
+            return
+
+        if not path.lower().endswith((".ptc", ".json")):
+            path += ".ptc"
+
+        self.current_session_path = path
+        self.session_name = Path(path).stem
+        self.update_window_title()
+        self.save_session()
 
     def build_layout(self):
         self.root.grid_columnconfigure(1, weight=1)
@@ -625,7 +831,13 @@ class LogConsultorDashboard:
         actions = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         actions.pack(fill="x", padx=12)
 
-        ActionButton(actions, "Importar logs", self.import_logs_dialog, primary=True).pack(fill="x", pady=5)
+        ActionButton(actions, "Nova consulta", self.new_session).pack(fill="x", pady=5)
+        ActionButton(actions, "Abrir consulta", self.open_session).pack(fill="x", pady=5)
+        ActionButton(actions, "Salvar consulta", self.save_session).pack(fill="x", pady=5)
+        ActionButton(actions, "Salvar consulta como", self.save_session_as).pack(fill="x", pady=5)
+
+        ActionButton(actions, "Importar arquivos", self.import_logs_dialog, primary=True).pack(fill="x", pady=5)
+        ActionButton(actions, "Importar pasta", self.import_folder_dialog).pack(fill="x", pady=5)
         ActionButton(actions, "Atualizar informações", self.recalculate_all).pack(fill="x", pady=5)
         ActionButton(actions, "Configurações", self.open_config).pack(fill="x", pady=5)
         ActionButton(actions, "Remover selecionado", self.remove_selected).pack(fill="x", pady=5)
@@ -829,39 +1041,93 @@ class LogConsultorDashboard:
         paths = filedialog.askopenfilenames(title="Selecionar logs .txt", filetypes=[("Logs TXT", "*.txt")])
         self.import_paths(list(paths))
 
+    def import_folder_dialog(self):
+        folder = filedialog.askdirectory(title="Selecionar pasta com logs")
+        if not folder:
+            return
+
+        recursive = messagebox.askyesno(
+            APP_NAME,
+            "Deseja incluir subpastas?\n\nUse 'Sim' para importar vários dias de uma vez.",
+        )
+
+        paths = collect_log_files_from_folder(folder, recursive=recursive)
+
+        if not paths:
+            messagebox.showwarning(APP_NAME, "Nenhum arquivo .txt foi encontrado na pasta selecionada.")
+            return
+
+        self.import_paths(paths)
+
     def import_paths(self, paths: List[str]):
         if not paths:
             return
 
         imported = 0
         skipped = 0
-        existing = {log.source_path for log in self.logs}
+        errors = 0
+
         default_paper = get_default_paper(self.cfg)
 
+        existing_fingerprints = {
+            log.source_fingerprint
+            for log in self.logs
+            if getattr(log, "source_fingerprint", "")
+        }
+
+        session_fingerprints = set(existing_fingerprints)
+
         for path in paths:
-            if not str(path).lower().endswith(".txt"):
-                skipped += 1
-                continue
-            if path in existing:
-                skipped += 1
-                continue
             try:
-                parsed = parse_log_file(path)
+                p = Path(path)
+
+                if not p.is_file():
+                    skipped += 1
+                    continue
+
+                if p.suffix.lower() != ".txt":
+                    skipped += 1
+                    continue
+
+                fingerprint = build_file_fingerprint(str(p))
+
+                if fingerprint in session_fingerprints:
+                    skipped += 1
+                    continue
+
+                parsed = parse_log_file(str(p))
+                parsed.source_fingerprint = fingerprint
+
                 apply_costs(parsed, self.cfg, default_paper["id"])
+
                 self.logs.append(parsed)
+                session_fingerprints.add(fingerprint)
                 imported += 1
-                existing.add(path)
+
             except Exception:
-                skipped += 1
+                errors += 1
 
         self.refresh_table()
         self.refresh_summary()
         self.show_consolidated_if_needed()
 
-        if imported == 0 and skipped > 0:
-            messagebox.showwarning(APP_NAME, "Nenhum novo log válido foi importado.")
-        elif imported > 0:
-            messagebox.showinfo(APP_NAME, f"Importados: {imported}\nIgnorados: {skipped}")
+        if imported > 0:
+            self.mark_dirty()
+
+        if imported == 0 and skipped > 0 and errors == 0:
+            messagebox.showwarning(
+                APP_NAME,
+                "Nenhum novo log válido foi importado.\n"
+                "Os arquivos podem já estar carregados ou não serem logs válidos.",
+            )
+            return
+
+        messagebox.showinfo(
+            APP_NAME,
+            f"Importados: {imported}\n"
+            f"Ignorados: {skipped}\n"
+            f"Erros: {errors}"
+        )
 
     def refresh_table(self):
         self.tree.delete(*self.tree.get_children())
@@ -941,6 +1207,7 @@ class LogConsultorDashboard:
         indexes = sorted(self.selected_log_indexes(), reverse=True)
         if not indexes:
             return
+
         for idx in indexes:
             if 0 <= idx < len(self.logs):
                 self.logs.pop(idx)
@@ -948,12 +1215,17 @@ class LogConsultorDashboard:
         self.refresh_table()
         self.refresh_summary()
         self.show_consolidated_if_needed()
+        self.mark_dirty()
 
     def clear_all(self):
+        if not self.logs:
+            return
+
         self.logs.clear()
         self.refresh_table()
         self.refresh_summary()
         self.show_consolidated_if_needed()
+        self.mark_dirty()
 
     def recalculate_all(self):
         self.cfg = load_config()
@@ -963,6 +1235,7 @@ class LogConsultorDashboard:
         self.refresh_table()
         self.refresh_summary()
         self.show_consolidated_if_needed()
+        self.mark_dirty()
         messagebox.showinfo(APP_NAME, "Informações recalculadas com base nas configurações atuais.")
 
     def apply_selected_paper(self):
@@ -984,6 +1257,7 @@ class LogConsultorDashboard:
         self.refresh_table()
         self.refresh_summary()
         self.show_consolidated_if_needed()
+        self.mark_dirty()
         messagebox.showinfo(APP_NAME, f"Papel aplicado aos logs selecionados: {paper['name']}")
 
     def open_config(self):
